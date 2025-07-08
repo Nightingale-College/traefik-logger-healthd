@@ -19,6 +19,7 @@ import (
 // Config holds the plugin configuration
 type Config struct {
 	LogFile string `json:"logFile,omitempty"`
+	Path    string `json:"requestPath,omitempty"`
 }
 
 // CreateConfig creates the default plugin configuration
@@ -40,17 +41,17 @@ type RequestLogger struct {
 
 // HealthdLogEntry represents a log entry in AWS Elastic Beanstalk healthd format
 type HealthdLogEntry struct {
-	Timestamp    string `json:"timestamp"`
-	RequestID    string `json:"request_id"`
-	IP           string `json:"ip"`
-	Method       string `json:"method"`
-	URI          string `json:"uri"`
-	Protocol     string `json:"protocol"`
-	Status       int    `json:"status"`
-	ContentSize  int64  `json:"content_size"`
-	RequestTime  int64  `json:"request_time"`
-	UserAgent    string `json:"user_agent"`
-	Referer      string `json:"referer"`
+	Timestamp     string `json:"timestamp"`
+	RequestID     string `json:"request_id"`
+	IP            string `json:"ip"`
+	Method        string `json:"method"`
+	URI           string `json:"uri"`
+	Protocol      string `json:"protocol"`
+	Status        int    `json:"status"`
+	ContentSize   int64  `json:"content_size"`
+	RequestTime   int64  `json:"request_time"`
+	UserAgent     string `json:"user_agent"`
+	Referer       string `json:"referer"`
 	XForwardedFor string `json:"x_forwarded_for,omitempty"`
 }
 
@@ -76,6 +77,12 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 // ServeHTTP implements the http.Handler interface
 func (r *RequestLogger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	startTime := time.Now()
+
+	if r.config.Path != "" && req.URL.Path != r.config.Path {
+		// skip request if there is a path filter and it doesn't match
+		r.next.ServeHTTP(rw, req)
+		return
+	}
 
 	// Generate a unique request ID
 	requestID := r.generateRequestID()

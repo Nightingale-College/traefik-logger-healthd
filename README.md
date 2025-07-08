@@ -35,7 +35,7 @@ services:
   traefik:
     image: traefik:v3.0
     command:
-      - --experimental.plugins.request-logger.modulename=github.com/your-username/traefik-request-logger
+      - --experimental.plugins.request-logger.modulename=github.com/Nightingale-College/traefik-logger-healthd
       - --experimental.plugins.request-logger.version=v1.0.0
     labels:
       - "traefik.http.middlewares.request-logger.plugin.request-logger.logFile=/var/log/requests.log"
@@ -50,7 +50,7 @@ services:
 experimental:
   plugins:
     request-logger:
-      modulename: github.com/your-username/traefik-request-logger
+      modulename: github.com/Nightingale-College/traefik-logger-healthd
       version: v1.0.0
 
 http:
