@@ -151,4 +151,4 @@ To test the plugin locally:
 
 ## License
 
-MIT License
+Apache License
