@@ -1,0 +1,6 @@
+displayName: Request Logger Plugin
+type: middleware
+import: github.com/Nightingale-College/traefik-logger-healthd
+summary: 'Logs request details including start time, URI, status, duration and forwarded IP to a configurable file'
+testData:
+  logFile: "/tmp/traefik-requests.log"
