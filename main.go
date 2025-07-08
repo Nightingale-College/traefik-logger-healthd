@@ -3,13 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -18,46 +16,147 @@ import (
 
 // Config holds the plugin configuration
 type Config struct {
-	LogFile string `json:"logFile,omitempty"`
-	Path    string `json:"requestPath,omitempty"`
+	LogFile        string `json:"logFile,omitempty"`        // Specific log file path (overrides LogDir if set)
+	Path           string `json:"requestPath,omitempty"`    // Only log requests matching this path
+	LogDir         string `json:"logDir,omitempty"`         // Directory for rotated logs
+	RotationFormat string `json:"rotationFormat,omitempty"` // Format for log file rotation (%Y-%m-%d-%H)
+	LogFormat      string `json:"logFormat,omitempty"`      // "apache" or "nginx"
+	AutoDetect     bool   `json:"autoDetect,omitempty"`     // Auto-detect server type
 }
 
 // CreateConfig creates the default plugin configuration
 func CreateConfig() *Config {
 	return &Config{
-		LogFile: "/var/log/traefik-requests.log",
+		LogFile:        "",                            // Empty means use LogDir with rotation
+		LogDir:         "/var/log/httpd/healthd",      // Default Elastic Beanstalk healthd directory for Apache
+		RotationFormat: "application.log.%Y-%m-%d-%H", // Standard Elastic Beanstalk hourly rotation format
+		LogFormat:      "apache",                      // Default format (apache or nginx)
+		AutoDetect:     true,                          // Automatically detect server type and adjust settings
 	}
 }
 
 // RequestLogger is the main plugin struct
 type RequestLogger struct {
-	next    http.Handler
-	name    string
-	config  *Config
-	mutex   sync.Mutex
-	logFile *os.File
-	writer  *bufio.Writer
+	next           http.Handler
+	name           string
+	config         *Config
+	mutex          sync.Mutex
+	logFile        *os.File
+	writer         *bufio.Writer
+	currentLogPath string
+	lastRotation   time.Time
 }
 
 // HealthdLogEntry represents a log entry in AWS Elastic Beanstalk healthd format
 type HealthdLogEntry struct {
-	Timestamp     string `json:"timestamp"`
-	RequestID     string `json:"request_id"`
-	IP            string `json:"ip"`
-	Method        string `json:"method"`
-	URI           string `json:"uri"`
-	Protocol      string `json:"protocol"`
-	Status        int    `json:"status"`
-	ContentSize   int64  `json:"content_size"`
-	RequestTime   int64  `json:"request_time"`
-	UserAgent     string `json:"user_agent"`
-	Referer       string `json:"referer"`
-	XForwardedFor string `json:"x_forwarded_for,omitempty"`
+	Timestamp     any // Unix timestamp in seconds (int64) for Apache, float64 for Nginx
+	URI           string      // Request URI
+	Status        int         // HTTP status code
+	RequestTime   any // Request time in microseconds (int64) for Apache, seconds (float64) for Nginx
+	UpstreamTime  any // Upstream response time (same as RequestTime in our implementation)
+	XForwardedFor string      // X-Forwarded-For header value
+}
+
+// getCurrentLogPath returns the current log file path based on rotation format
+func (r *RequestLogger) getCurrentLogPath() string {
+	now := time.Now()
+
+	if r.config.LogFile != "" {
+		return r.config.LogFile
+	}
+
+	// Use time format string to generate the path following AWS Elastic Beanstalk healthd convention
+	timeFormat := r.config.RotationFormat
+
+	// Replace AWS Elastic Beanstalk format placeholders (matching rotatelogs format)
+	timeFormat = strings.ReplaceAll(timeFormat, "%Y", fmt.Sprintf("%d", now.Year()))
+	timeFormat = strings.ReplaceAll(timeFormat, "%m", fmt.Sprintf("%02d", now.Month()))
+	timeFormat = strings.ReplaceAll(timeFormat, "%d", fmt.Sprintf("%02d", now.Day()))
+	timeFormat = strings.ReplaceAll(timeFormat, "%H", fmt.Sprintf("%02d", now.Hour()))
+
+	return filepath.Join(r.config.LogDir, timeFormat)
+}
+
+// ensureLogFileOpen ensures the log file is open and ready for writing
+func (r *RequestLogger) ensureLogFileOpen() error {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	currentPath := r.getCurrentLogPath()
+
+	// If we have a file open already, check if it's the current path
+	if r.logFile != nil {
+		// If paths match, we're good
+		if r.currentLogPath == currentPath {
+			return nil
+		}
+
+		// Paths don't match, need to close current file
+		if r.writer != nil {
+			r.writer.Flush()
+		}
+		r.logFile.Close()
+		r.logFile = nil
+		r.writer = nil
+	}
+
+	// Create parent directory if it doesn't exist
+	dir := filepath.Dir(currentPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create log directory for %s: %w", currentPath, err)
+	}
+
+	// Open the new log file
+	logFile, err := os.OpenFile(currentPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open log file %s: %w", currentPath, err)
+	}
+
+	r.logFile = logFile
+	r.writer = bufio.NewWriter(logFile)
+	r.currentLogPath = currentPath
+	r.lastRotation = time.Now()
+	return nil
 }
 
 // New creates a new RequestLogger plugin
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	// Open log file for writing (create if doesn't exist, append if exists)
+	// Auto-detect server type if enabled
+	if config.AutoDetect {
+		// Check for Apache or Nginx environment and adjust defaults if needed
+		if _, err := os.Stat("/etc/nginx"); err == nil {
+			if config.LogDir == "/var/log/httpd/healthd" {
+				// If Nginx is detected and we're using the Apache default, switch to Nginx path
+				config.LogDir = "/var/log/nginx/healthd"
+			}
+			if config.LogFormat == "apache" {
+				config.LogFormat = "nginx"
+			}
+		}
+	}
+
+	// Ensure log directory exists if we're not using a specific file path
+	if config.LogFile == "" {
+		if err := os.MkdirAll(config.LogDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create log directory %s: %w", config.LogDir, err)
+		}
+
+		// We'll open the file on first request
+		return &RequestLogger{
+			next:   next,
+			name:   name,
+			config: config,
+			mutex:  sync.Mutex{},
+		}, nil
+	}
+
+	// Ensure directory exists for the specific log file path
+	dir := filepath.Dir(config.LogFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create log directory for %s: %w", config.LogFile, err)
+	}
+
+	// If specific log file is provided, open it now
 	logFile, err := os.OpenFile(config.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open log file %s: %w", config.LogFile, err)
@@ -66,11 +165,13 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	writer := bufio.NewWriter(logFile)
 
 	return &RequestLogger{
-		next:    next,
-		name:    name,
-		config:  config,
-		logFile: logFile,
-		writer:  writer,
+		next:           next,
+		name:           name,
+		config:         config,
+		logFile:        logFile,
+		writer:         writer,
+		currentLogPath: config.LogFile,
+		lastRotation:   time.Now(),
 	}, nil
 }
 
@@ -78,48 +179,69 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 func (r *RequestLogger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	startTime := time.Now()
 
+	// Don't log healthcheck requests if they come from AWS ELB or ALB
+	// This is to reduce noise in the logs
+	userAgent := req.Header.Get("User-Agent")
+	if strings.Contains(userAgent, "ELB-HealthChecker") || strings.Contains(userAgent, "ALB-HealthChecker") {
+		return
+	}
+
 	if r.config.Path != "" && req.URL.Path != r.config.Path {
 		// skip request if there is a path filter and it doesn't match
 		r.next.ServeHTTP(rw, req)
 		return
 	}
 
-	// Generate a unique request ID
-	requestID := r.generateRequestID()
+	// Ensure log file is open and rotated if needed
+	if err := r.ensureLogFileOpen(); err != nil {
+		// Log to stderr if we can't open the log file
+		fmt.Fprintf(os.Stderr, "Error opening healthd log file: %v\n", err)
+		// Still process the request but don't attempt to log it
+		r.next.ServeHTTP(rw, req)
+		return
+	}
 
 	// Create a response writer wrapper to capture status code and content size
 	wrappedWriter := &responseWriter{
 		ResponseWriter: rw,
-		statusCode:     200, // Default status code
+		statusCode:     0, // Will be set when WriteHeader is called, defaults to 200 in Write() if not set
 		contentSize:    0,
 	}
 
-	// Get the client IP address
-	clientIP := r.getForwardedIP(req)
-
 	// Get X-Forwarded-For header for logging (if present)
 	xForwardedFor := req.Header.Get("X-Forwarded-For")
+	if xForwardedFor == "" {
+		// Fallback to remote address if X-Forwarded-For is not present
+		xForwardedFor = stripPort(req.RemoteAddr)
+	}
 
 	// Call the next handler
 	r.next.ServeHTTP(wrappedWriter, req)
 
-	// Calculate request time in microseconds (healthd format)
+	// Calculate request time based on format
 	duration := time.Since(startTime)
-	requestTimeUs := duration.Microseconds()
+
+	var timestamp, requestTime, upstreamTime any
+
+	if r.config.LogFormat == "nginx" {
+		// Nginx format: timestamp as unix seconds with millisecond precision, request time in seconds
+		timestamp = float64(startTime.Unix()) + float64(startTime.Nanosecond())/1e9
+		requestTime = float64(duration.Nanoseconds()) / 1e9
+		upstreamTime = requestTime // Same as request time in our implementation
+	} else {
+		// Apache format: timestamp in seconds, request time in microseconds
+		timestamp = startTime.Unix()
+		requestTime = duration.Microseconds()
+		upstreamTime = requestTime // Same as request time in our implementation
+	}
 
 	// Create healthd format log entry
 	logEntry := HealthdLogEntry{
-		Timestamp:     startTime.Format("2006-01-02T15:04:05.000000Z"),
-		RequestID:     requestID,
-		IP:            clientIP,
-		Method:        req.Method,
-		URI:           req.RequestURI,
-		Protocol:      req.Proto,
+		Timestamp:     timestamp,
+		URI:           req.URL.Path, // Using Path instead of RequestURI to match Apache/Nginx behavior
 		Status:        wrappedWriter.statusCode,
-		ContentSize:   wrappedWriter.contentSize,
-		RequestTime:   requestTimeUs,
-		UserAgent:     req.Header.Get("User-Agent"),
-		Referer:       req.Header.Get("Referer"),
+		RequestTime:   requestTime,
+		UpstreamTime:  upstreamTime, // Same as request time in our implementation
 		XForwardedFor: xForwardedFor,
 	}
 
@@ -150,95 +272,86 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// getForwardedIP extracts the most appropriate client IP address from request headers
-func (r *RequestLogger) getForwardedIP(req *http.Request) string {
-	// First, try to get the real client IP from X-Forwarded-For
-	// This is the most reliable for getting the original client IP through proxy chains
-	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
-		// X-Forwarded-For format: client, proxy1, proxy2
-		// We want the leftmost (first) IP which is the original client
-		ips := r.parseXForwardedFor(xff)
-		if len(ips) > 0 && r.isValidClientIP(ips[0]) {
-			return ips[0]
-		}
-	}
-
-	// Try X-Real-IP (commonly used by nginx)
-	if realIP := req.Header.Get("X-Real-IP"); realIP != "" && r.isValidClientIP(realIP) {
-		return realIP
-	}
-
-	// Try CF-Connecting-IP (Cloudflare's original client IP)
-	if cfIP := req.Header.Get("CF-Connecting-IP"); cfIP != "" && r.isValidClientIP(cfIP) {
-		return cfIP
-	}
-
-	// Try True-Client-IP (used by some CDNs and load balancers)
-	if trueIP := req.Header.Get("True-Client-IP"); trueIP != "" && r.isValidClientIP(trueIP) {
-		return trueIP
-	}
-
-	// Try X-Client-IP (less common but still used)
-	if clientIP := req.Header.Get("X-Client-IP"); clientIP != "" && r.isValidClientIP(clientIP) {
-		return clientIP
-	}
-
-	// Try X-Forwarded (less common variant)
-	if forwarded := req.Header.Get("X-Forwarded"); forwarded != "" {
-		if ip := r.extractIPFromForwarded(forwarded); ip != "" && r.isValidClientIP(ip) {
-			return ip
-		}
-	}
-
-	// Try standard Forwarded header (RFC 7239)
-	if forwarded := req.Header.Get("Forwarded"); forwarded != "" {
-		if ip := r.extractIPFromForwarded(forwarded); ip != "" && r.isValidClientIP(ip) {
-			return ip
-		}
-	}
-
-	// Fallback to remote address, strip port if present
-	return r.stripPort(req.RemoteAddr)
-}
-
 // writeLogEntry writes a log entry to the file in healthd format
 func (r *RequestLogger) writeLogEntry(entry HealthdLogEntry) {
+	if r.writer == nil {
+		// If writer is not available, we can't log
+		return
+	}
+
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	// Convert to JSON
-	jsonData, err := json.Marshal(entry)
-	if err != nil {
-		// If JSON marshaling fails, write a simple log line
-		logLine := fmt.Sprintf("ERROR marshaling JSON: timestamp=%s request_id=%s ip=%s method=%s uri=%s status=%d\n",
-			entry.Timestamp, entry.RequestID, entry.IP, entry.Method, entry.URI, entry.Status)
-		r.writer.WriteString(logLine)
+	var logLine string
+
+	// Format log entry according to AWS Elastic Beanstalk healthd format
+	if r.config.LogFormat == "nginx" {
+		// Nginx format: $msec"$uri"$status"$request_time"$upstream_response_time"$http_x_forwarded_for
+		timestamp, ok := entry.Timestamp.(float64)
+		if !ok {
+			// Handle type conversion error
+			timestamp = float64(time.Now().Unix())
+		}
+
+		requestTime, ok := entry.RequestTime.(float64)
+		if !ok {
+			// Handle type conversion error
+			requestTime = 0.0
+		}
+
+		upstreamTime, ok := entry.UpstreamTime.(float64)
+		if !ok {
+			// Handle type conversion error
+			upstreamTime = requestTime
+		}
+
+		logLine = fmt.Sprintf("%.3f\"%s\"%d\"%.6f\"%.6f\"%s\n",
+			timestamp,
+			entry.URI,
+			entry.Status,
+			requestTime,
+			upstreamTime,
+			entry.XForwardedFor)
 	} else {
-		r.writer.Write(jsonData)
-		r.writer.WriteString("\n")
+		// Apache format: %{%s}t"%U"%s"%D"%D"%{X-Forwarded-For}i
+		timestamp, ok := entry.Timestamp.(int64)
+		if !ok {
+			// Handle type conversion error
+			timestamp = time.Now().Unix()
+		}
+
+		requestTime, ok := entry.RequestTime.(int64)
+		if !ok {
+			// Handle type conversion error
+			requestTime = 0
+		}
+
+		upstreamTime, ok := entry.UpstreamTime.(int64)
+		if !ok {
+			// Handle type conversion error
+			upstreamTime = requestTime
+		}
+
+		logLine = fmt.Sprintf("%d\"%s\"%d\"%d\"%d\"%s\n",
+			timestamp,
+			entry.URI,
+			entry.Status,
+			requestTime,
+			upstreamTime,
+			entry.XForwardedFor)
 	}
+
+	r.writer.WriteString(logLine)
 
 	// Flush the buffer to ensure data is written
 	r.writer.Flush()
 }
 
-// generateRequestID generates a unique request ID similar to healthd format
-func (r *RequestLogger) generateRequestID() string {
-	// Generate 8 random bytes and encode as hex (16 characters)
-	bytes := make([]byte, 8)
-	if _, err := rand.Read(bytes); err != nil {
-		// Fallback to timestamp-based ID if random generation fails
-		return fmt.Sprintf("req_%d", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(bytes)
-}
-
 // parseXForwardedFor parses the X-Forwarded-For header and returns a slice of IP addresses
-func (r *RequestLogger) parseXForwardedFor(xff string) []string {
+func parseXForwardedFor(xff string) []string {
 	var ips []string
 	// Split by comma and clean up each IP
-	parts := strings.Split(xff, ",")
-	for _, part := range parts {
+	for part := range strings.SplitSeq(xff, ",") {
 		ip := strings.TrimSpace(part)
 		if ip != "" {
 			ips = append(ips, ip)
@@ -247,64 +360,8 @@ func (r *RequestLogger) parseXForwardedFor(xff string) []string {
 	return ips
 }
 
-// isValidClientIP checks if the IP address is a valid client IP (not private/internal)
-func (r *RequestLogger) isValidClientIP(ip string) bool {
-	// Remove port if present
-	host := r.stripPort(ip)
-
-	// Parse the IP
-	parsedIP := net.ParseIP(host)
-	if parsedIP == nil {
-		return false
-	}
-
-	// Reject obviously invalid IPs
-	if parsedIP.IsUnspecified() || parsedIP.IsLoopback() {
-		return false
-	}
-
-	// For IPv4, check for private ranges
-	if parsedIP.To4() != nil {
-		// Allow private IPs in development/internal environments
-		// but prefer public IPs when available
-		return true
-	}
-
-	// For IPv6, basic validation
-	if parsedIP.To16() != nil {
-		// Reject IPv6 loopback and link-local addresses
-		if parsedIP.Equal(net.IPv6loopback) || parsedIP.IsLinkLocalUnicast() {
-			return false
-		}
-		return true
-	}
-
-	return false
-}
-
-// isPublicIP checks if an IP address is public (not in private ranges)
-func (r *RequestLogger) isPublicIP(ip string) bool {
-	host := r.stripPort(ip)
-	parsedIP := net.ParseIP(host)
-	if parsedIP == nil {
-		return false
-	}
-
-	// IPv4 private ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-	if parsedIP.To4() != nil {
-		return !parsedIP.IsPrivate() && !parsedIP.IsLoopback() && !parsedIP.IsUnspecified()
-	}
-
-	// IPv6 - check for private/local ranges
-	if parsedIP.To16() != nil {
-		return !parsedIP.IsPrivate() && !parsedIP.IsLoopback() && !parsedIP.IsLinkLocalUnicast() && !parsedIP.IsUnspecified()
-	}
-
-	return false
-}
-
 // stripPort removes the port from an IP address string if present
-func (r *RequestLogger) stripPort(address string) string {
+func stripPort(address string) string {
 	// Handle IPv6 addresses with ports: [::1]:8080
 	if strings.HasPrefix(address, "[") {
 		if closeBracket := strings.Index(address, "]"); closeBracket != -1 {
@@ -322,7 +379,7 @@ func (r *RequestLogger) stripPort(address string) string {
 }
 
 // extractIPFromForwarded extracts IP from Forwarded header (RFC 7239)
-func (r *RequestLogger) extractIPFromForwarded(forwarded string) string {
+func extractIPFromForwarded(forwarded string) string {
 	// Forwarded header format: for=192.0.2.60;proto=http;by=203.0.113.43
 	// or: for="[2001:db8:cafe::17]:4711"
 
