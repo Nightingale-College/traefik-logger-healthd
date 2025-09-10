@@ -351,7 +351,7 @@ func (r *RequestLogger) writeLogEntry(entry HealthdLogEntry) {
 func parseXForwardedFor(xff string) []string {
 	var ips []string
 	// Split by comma and clean up each IP
-	for part := range strings.SplitSeq(xff, ",") {
+	for _, part := range strings.Split(xff, ",") {
 		ip := strings.TrimSpace(part)
 		if ip != "" {
 			ips = append(ips, ip)
