@@ -1,4 +1,4 @@
-package main
+package traefik_logger_healthd
 
 import (
 	"bufio"

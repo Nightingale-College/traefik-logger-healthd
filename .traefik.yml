@@ -1,6 +1,6 @@
-displayName: Healthd Logging: Enhanded Format
+displayName: Healthd Logging - Enhanded Format
 type: middleware
-import: github.com/Nightingale-College/traefik-logger-healthd
+import: github.com/nightingale-college/traefik-logger-healthd
 summary: 'Log requests using the healthd format so ElasticBeanStalk and other platforms can assess health'
 testData:
   logFile: "/tmp/traefik-requests.log"
