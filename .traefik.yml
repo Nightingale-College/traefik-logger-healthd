@@ -1,6 +1,6 @@
-displayName: Request Logger Plugin
+displayName: Healthd Logging: Enhanded Format
 type: middleware
 import: github.com/Nightingale-College/traefik-logger-healthd
-summary: 'Logs request details including start time, URI, status, duration and forwarded IP to a configurable file'
+summary: 'Log requests using the healthd format so ElasticBeanStalk and other platforms can assess health'
 testData:
   logFile: "/tmp/traefik-requests.log"
