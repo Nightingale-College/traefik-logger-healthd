@@ -17,8 +17,8 @@ import (
 // Config holds the plugin configuration
 type Config struct {
 	LogFile        string `json:"logFile,omitempty"`        // Specific log file path (overrides LogDir if set)
-	Path           string `json:"requestPath,omitempty"`    // Only log requests matching this path
 	LogDir         string `json:"logDir,omitempty"`         // Directory for rotated logs
+	RequestPath    string `json:"requestPath,omitempty"`  // Only log requests matching this path
 	RotationFormat string `json:"rotationFormat,omitempty"` // Format for log file rotation (%Y-%m-%d-%H)
 	LogFormat      string `json:"logFormat,omitempty"`      // "apache" or "nginx"
 	AutoDetect     bool   `json:"autoDetect,omitempty"`     // Auto-detect server type
@@ -27,7 +27,8 @@ type Config struct {
 // CreateConfig creates the default plugin configuration
 func CreateConfig() *Config {
 	return &Config{
-		LogFile:        "",                            // Empty means use LogDir with rotation
+		LogFile:        "", // Empty means use LogDir with rotation
+		RequestPath:    "/",
 		LogDir:         "/var/log/httpd/healthd",      // Default Elastic Beanstalk healthd directory for Apache
 		RotationFormat: "application.log.%Y-%m-%d-%H", // Standard Elastic Beanstalk hourly rotation format
 		LogFormat:      "apache",                      // Default format (apache or nginx)
@@ -49,12 +50,12 @@ type RequestLogger struct {
 
 // HealthdLogEntry represents a log entry in AWS Elastic Beanstalk healthd format
 type HealthdLogEntry struct {
-	Timestamp     any // Unix timestamp in seconds (int64) for Apache, float64 for Nginx
-	URI           string      // Request URI
-	Status        int         // HTTP status code
-	RequestTime   any // Request time in microseconds (int64) for Apache, seconds (float64) for Nginx
-	UpstreamTime  any // Upstream response time (same as RequestTime in our implementation)
-	XForwardedFor string      // X-Forwarded-For header value
+	Timestamp     any    // Unix timestamp in seconds (int64) for Apache, float64 for Nginx
+	URI           string // Request URI
+	Status        int    // HTTP status code
+	RequestTime   any    // Request time in microseconds (int64) for Apache, seconds (float64) for Nginx
+	UpstreamTime  any    // Upstream response time (same as RequestTime in our implementation)
+	XForwardedFor string // X-Forwarded-For header value
 }
 
 // getCurrentLogPath returns the current log file path based on rotation format
@@ -121,6 +122,7 @@ func (r *RequestLogger) ensureLogFileOpen() error {
 
 // New creates a new RequestLogger plugin
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
+	fmt.Printf("config: %v\n", config)
 	// Auto-detect server type if enabled
 	if config.AutoDetect {
 		// Check for Apache or Nginx environment and adjust defaults if needed
@@ -186,7 +188,8 @@ func (r *RequestLogger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if r.config.Path != "" && req.URL.Path != r.config.Path {
+	fmt.Println("Config", r.config.RequestPath, req.URL.Path)
+	if r.config.RequestPath != "" && strings.HasPrefix(r.config.RequestPath, req.URL.Path) {
 		// skip request if there is a path filter and it doesn't match
 		r.next.ServeHTTP(rw, req)
 		return
