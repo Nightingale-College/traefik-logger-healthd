@@ -189,7 +189,7 @@ func (r *RequestLogger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	fmt.Println("Config", r.config.RequestPath, req.URL.Path)
-	if r.config.RequestPath != "" && strings.HasPrefix(r.config.RequestPath, req.URL.Path) {
+	if r.config.RequestPath != "" && !strings.HasPrefix(r.config.RequestPath, req.URL.Path) {
 		// skip request if there is a path filter and it doesn't match
 		r.next.ServeHTTP(rw, req)
 		return
