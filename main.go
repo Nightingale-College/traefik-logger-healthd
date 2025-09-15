@@ -28,7 +28,7 @@ type Config struct {
 func CreateConfig() *Config {
 	return &Config{
 		LogFile:        "", // Empty means use LogDir with rotation
-		RequestPath:    "/",
+		RequestPath:    "/platform/health",
 		LogDir:         "/var/log/httpd/healthd",      // Default Elastic Beanstalk healthd directory for Apache
 		RotationFormat: "application.log.%Y-%m-%d-%H", // Standard Elastic Beanstalk hourly rotation format
 		LogFormat:      "apache",                      // Default format (apache or nginx)
